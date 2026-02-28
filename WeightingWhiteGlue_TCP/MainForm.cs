@@ -61,11 +61,12 @@ namespace WeightingWhiteGlue
 
         private void MainForm_Load(object sender, EventArgs e)
         {
-            UpdateUI(() => UpdateDGV());
+            //UpdateUI(() => UpdateDGV());
         }
 
         private void UpdateDGV()
         {
+            if (string.IsNullOrEmpty(this.cmbConvertMachine.Text)) return;
             // 绑定DataGridView
             DataTable ds = SA.GetDataTable($@"
 SELECT TOP 1000 
@@ -74,6 +75,8 @@ FROM WeighingRecord
 Order By WeighingTimeBegin DESC"
 , Utils.GetParameterValue("DBConnStr"));
             dgvRecords.DataSource = ds;
+            // 设置第一行高亮
+            HighlightFirstRow();
         }
 
         private void dgvRecords_CellFormatting(object sender, DataGridViewCellFormattingEventArgs e)
@@ -259,6 +262,8 @@ Order By WeighingTimeBegin DESC"
                 numWaterRate.Enabled = true;
 
                 ConnectToScale();
+                // 连接成功后，初始化DataGridView
+                UpdateUI(() => UpdateDGV());
             }
             catch (Exception ex)
             {
@@ -522,7 +527,14 @@ Order By WeighingTimeBegin DESC"
                     _lastReadTime = DateTime.Now;
 
                     // 保存到DataGridView
-                    UpdateUI(() => SaveToDGV());
+                    //UpdateUI(() => SaveToDGV());
+                    UpdateUI(() =>
+                    {
+                        if (chkAutoRead.Checked)
+                            AutoSave(); // 自动称重
+                        else
+                            SaveToDGV(); // 手动称重
+                    });
                     UpdateUI(() => UpdateDGV());
                     Log($"[解析成功]: {_currentWeightTypeName} = {weightStr}{unit}");
                 }
@@ -534,17 +546,6 @@ Order By WeighingTimeBegin DESC"
                 {
                     UpdateLblStatus($"解析数据错误: {ex.Message}", Color.Red);
                 });
-                // TODO
-                //if (_isBeginWeighing)
-                //{
-                //    btnRead.Enabled = false;
-                //    btnReadEnd.Enabled = true;
-                //}
-                //else
-                //{
-                //    btnRead.Enabled = true;
-                //    btnReadEnd.Enabled = false;
-                //}
             }
         }
 
@@ -601,6 +602,11 @@ Order By WeighingTimeBegin DESC"
             }
         }
 
+        /// <summary>
+        /// 每隔10分钟自动称重一次
+        /// </summary>
+        /// <param name="sender"></param>
+        /// <param name="e"></param>
         private void AutoReadTimer_Tick(object sender, EventArgs e)
         {
             if (!_isReadingData)
@@ -611,7 +617,129 @@ Order By WeighingTimeBegin DESC"
             }
         }
 
-        private void SaveToDGV()
+        #region 自动称重模块
+
+        /// <summary>
+        /// 记录上次称重的重量到本地文件
+        /// </summary>
+        /// <param name="weight"></param>
+        private static void WriteLastAutoWeight(double weight)
+        {
+            string filePath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "LastAutoWeight.txt");
+            File.WriteAllText(filePath, weight.ToString());
+        }
+        /// <summary>
+        /// 从本地文件读取上次称重的重量
+        /// </summary>
+        /// <returns></returns>
+        private static double ReadLastAutoWeight()
+        {
+            string filePath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "LastAutoWeight.txt");
+            if (File.Exists(filePath))
+            {
+                string content = File.ReadAllText(filePath);
+                if (double.TryParse(content, out double weight))
+                {
+                    return weight;
+                }
+            }
+            return 0;
+        }
+        private void AutoSave()
+        {
+            // 0.查询最后一次称重记录
+            string sql = $@"
+SELECT TOP 1 Id,WeighingWeightBegin,WeighingTimeBegin,WeighingWeightEnd,WeighingTimeEnd 
+FROM [dbo].[WeighingRecord] 
+WHERE MachineId='{this.cmbConvertMachine.Text}'
+ORDER BY WeighingTimeBegin DESC";
+            DataTable dt = SA.GetDataTable(sql, Utils.GetParameterValue("DBConnStr"));
+
+            // 1.第一次自动称重
+            if (dt?.Rows?.Count == 0)
+            {
+                AutoInsert(); // 如果没有记录，直接插入新记录
+                WriteLastAutoWeight(Convert.ToDouble(_currentWeight));
+                return;
+            }
+
+            // 2.没有结束时间
+            // 开始时间不能超过当前1天
+            // 本次重量大于上次重量
+            // 则更新上次记录的结束重量和时间，并插入新记录
+            if (!DateTime.TryParse(dt?.Rows?[0]?["WeighingTimeEnd"]?.ToString(), out _))
+            {
+                DateTime? startTime = Convert.ToDateTime(dt?.Rows[0]?["WeighingTimeBegin"]?.ToString()); // 开始时间
+                if (DateTime.Now - startTime <= TimeSpan.FromDays(1))
+                {
+                    double currentWeight = Convert.ToDouble(_currentWeight);
+                    double lastWeight = ReadLastAutoWeight();
+                    if (currentWeight - lastWeight > 0.5) // 防止抖动
+                    {
+                        // 如果大于上次重量，则更新最后一次称重记录
+                        AutoUpdate(lastWeight);
+                        AutoInsert();
+                    }
+                }
+                else
+                { // 超过1天，更新上次的称重记录，并直接插入新记录
+                    double lastWeight = ReadLastAutoWeight();
+                    AutoUpdate(lastWeight);
+                    AutoInsert();
+                }
+            }
+            else
+            { // 有结束时间，直接插入新记录
+                AutoInsert();
+            }
+            // 记录上次自动称重重量，用于下次比较
+            WriteLastAutoWeight(Convert.ToDouble(_currentWeight));
+        }
+        #endregion
+
+        private void AutoInsert()
+        {
+            string insertSql = string.Format(@"
+INSERT INTO WeighingRecord 
+(Plant,MachineId,Shift,WeighingType,WaterRate,WeighingWeightBegin,WeighingTimeBegin,Site) 
+VALUES ('{0}','{1}','{2}','{3}','{4}','{5}','{6}','{7}'); 
+SELECT SCOPE_IDENTITY();"
+                    , this.cmbPlant.Text
+                    , this.cmbConvertMachine.Text
+                    , (this.cmbShift.SelectedItem as ComboBoxItem).Value
+                    , _currentWeightType
+                    , this.numWaterRate.Value
+                    , Convert.ToDecimal(_currentWeight)
+                    , DateTime.Now
+                    , this.cmbSite.Text);
+            Log("SqlRecords", insertSql);
+            string addRes = SA.ExecuteScalar(insertSql, Utils.GetParameterValue("DBConnStr")).ToString();
+            if (int.TryParse(addRes, out int newId))
+            {
+                _lastId = newId; // 设置最后一次新增记录的ID
+            }
+            UpdateLblStatus($"状态: 记录已新增", Color.Green);
+            Log($"{addRes}记录已新增: 开始称重重量 {_currentWeight}{_currentUnit}");
+        }
+        private void AutoUpdate(double? weight = null)
+        {
+            if (weight == null)
+            {
+                weight = Convert.ToDouble(_currentWeight);
+            }
+            string updateSql = string.Format("UPDATE WeighingRecord SET WeighingWeightEnd='{0}',WeighingTimeEnd='{1}',WaterRate='{2}' WHERE Id='{3}'"
+                    , weight
+                    , DateTime.Now
+                    , this.numWaterRate.Value
+                    , _lastId);
+            Log("SqlRecords", updateSql);
+            int upRes = SA.ExecuteNonQuery(updateSql, Utils.GetParameterValue("DBConnStr"));
+            UpdateLblStatus($"状态: 记录已更新", Color.Green);
+            Log($"{_lastId}记录已更新: 结束称重重量 {_currentWeight}{_currentUnit}");
+            _lastId = null;
+        }
+
+        private void SaveToDGV_old()
         {
             if (string.IsNullOrEmpty(_currentWeight) || _currentWeight.Trim() == "0.000")
             {
@@ -655,6 +783,40 @@ SELECT SCOPE_IDENTITY();"
                 _lastId = null;
             }
         }
+        private void SaveToDGV()
+        {
+            if (string.IsNullOrEmpty(_currentWeight) || _currentWeight.Trim() == "0.000")
+            {
+                MessageBox.Show("当前重量为零，无需保存！", "提示", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+
+            if (_isBeginWeighing) // 开始称重 新增
+            {
+                AutoInsert();
+            }
+            else // 结束称重 修改
+            {
+                AutoUpdate();
+            }
+        }
+
+        /// <summary>
+        /// 直接设置第一行的高亮样式
+        /// </summary>
+        private void HighlightFirstRow()
+        {
+            // 关键判断：确保DataGridView有数据行，避免索引越界
+            if (dgvRecords.Rows.Count > 0 && !dgvRecords.Rows[0].IsNewRow)
+            {
+                // 设置行的背景色（高亮核心）
+                dgvRecords.Rows[0].DefaultCellStyle.BackColor = Color.LightSkyBlue;
+                // 可选：设置前景色（文字颜色），提升对比度
+                dgvRecords.Rows[0].DefaultCellStyle.ForeColor = Color.DarkBlue;
+                // 可选：设置字体加粗，强化高亮效果
+                dgvRecords.Rows[0].DefaultCellStyle.Font = new Font(dgvRecords.Font, FontStyle.Bold);
+            }
+        }
 
         private void UpdateLblStatus(string content, Color color)
         {
@@ -670,6 +832,10 @@ SELECT SCOPE_IDENTITY();"
         private static void Log(string data)
         {
             Utils.AppendToFile(Utils.SystemLogFile, data, true);
+        }
+        private static void Log(string logPath, string data)
+        {
+            Utils.AppendToFile(logPath, data, true);
         }
 
     }
